@@ -1,5 +1,5 @@
 [project]
-name = "euphony-local"
+name = "codex-spelunker"
 version = "0.1.0"
 # Main dependencies for the euphony FastAPI server.
 dependencies = [

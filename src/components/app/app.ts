@@ -99,7 +99,7 @@ const NUM_FORMATTER = format(',d');
 const DEFAULT_ITEMS_PER_PAGE = 10;
 const HEADER_HEIGHT = 72;
 const DEFAULT_CODEX_DIRECTORY = '~/.codex';
-const LOCAL_CODEX_OVERRIDE_STORAGE_KEY = 'euphony.localCodexBaseDir';
+const LOCAL_CODEX_OVERRIDE_STORAGE_KEY = 'codex-spelunker.localCodexBaseDir';
 
 interface CodexSessionIndexEntry {
   id: string;
@@ -2114,7 +2114,8 @@ export class EuphonyApp extends LitElement {
     this.hasCodexDirectoryAccess = hasPermission;
     if (!hasPermission) {
       this.shouldShowAlternateCodexFolderOption = true;
-      this.toastMessage = 'Euphony needs read access to the selected Codex folder.';
+      this.toastMessage =
+        'Codex Spelunker needs read access to the selected Codex folder.';
       this.toastType = 'error';
       this.toastComponent?.show();
       return;
@@ -4242,10 +4243,11 @@ export class EuphonyApp extends LitElement {
         <div class="header">
           <div class="header-branding">
             <a class="name" href="./"
-              >${this.isEditorMode ? 'Euphony Editor' : 'Euphony Local'}</a
+              >${this.isEditorMode ? 'Codex Spelunker Editor' : 'Codex Spelunker'}</a
             >
             <div class="header-subtitle">
-              Browse local Codex sessions, projects, and semantic search
+              Browse local Codex sessions, projects, and timelines, built on
+              Euphony
             </div>
           </div>
           <input

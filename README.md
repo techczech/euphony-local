@@ -1,16 +1,21 @@
-# Euphony Local
+# Codex Spelunker
 
-`euphony-local` is a local-first fork of [OpenAI Euphony](https://github.com/openai/euphony) for browsing Codex session history on your own machine.
+Codex Spelunker is a local Codex history browser built on [OpenAI Euphony](https://github.com/openai/euphony).
 
-It keeps the original Harmony and Codex rendering capabilities, but changes the product focus from "open a public JSON or JSONL URL" to "browse local agent history, projects, and sessions directly from a local Codex store."
+It is for browsing, searching, and analyzing Codex session history on your own machine. The upstream Euphony viewer is still the foundation, but this fork shifts the product from a generic JSON viewer to a local-first browser for agent sessions, projects, timelines, and usage patterns.
+
+## Tagline
+
+Browse local Codex sessions, projects, and timelines, built on Euphony.
 
 ## What It Does
 
 - browses local Codex history from the default `~/.codex` store
 - merges archived, legacy, and newer recursive session logs into one browser
 - groups sessions into projects inferred from local session metadata
+- filters sessions by project, folder, and time range
+- shows usage/activity statistics over time
 - opens full sessions from the session list with a local backend
-- supports live filtering by session title, first prompt, project, and folder
 - adds semantic and keyword search over Codex session content using local `qmd`
 
 ## How It Was Created
@@ -22,6 +27,7 @@ The main changes from upstream are:
 - a FastAPI backend that can read local Codex history
 - a local session index and project browser
 - session metadata caching in SQLite for faster browsing
+- time-based filtering and usage analytics
 - local `qmd` integration for semantic and keyword search over session content
 - a homepage and navigation flow centered on local sessions rather than public JSON URLs
 
@@ -44,7 +50,7 @@ It supports:
 
 ## qmd Integration
 
-`euphony-local` calls the local `qmd` CLI directly from the backend. It does not require a separate qmd HTTP service.
+Codex Spelunker calls the local `qmd` CLI directly from the backend. It does not require a separate qmd HTTP service.
 
 Default path:
 
@@ -98,4 +104,4 @@ Open:
 
 ## Upstream
 
-Based on [OpenAI Euphony](https://github.com/openai/euphony).
+Codex Spelunker is built on [OpenAI Euphony](https://github.com/openai/euphony).

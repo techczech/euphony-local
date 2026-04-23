@@ -1,4 +1,4 @@
-const DB_NAME = 'euphony-local';
+const DB_NAME = 'codex-spelunker';
 const STORE_NAME = 'handles';
 const CODEX_DIRECTORY_KEY = 'codex-directory';
 

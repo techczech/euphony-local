@@ -42,9 +42,9 @@ DIST_DIR = Path(__file__).resolve().parents[1] / "dist"
 DEFAULT_CODEX_DIR = Path.home() / ".codex"
 DEFAULT_GITREPOS_DIR = Path.home() / "gitrepos"
 QMD_BIN = Path(os.environ.get("QMD_BIN", "/opt/homebrew/bin/qmd")).expanduser()
-QMD_CODEX_INDEX_NAME = "euphony-local-codex"
+QMD_CODEX_INDEX_NAME = "codex-spelunker-codex"
 QMD_CODEX_COLLECTION = "codex-sessions-local"
-EUPHONY_LOCAL_CACHE_DIR = Path.home() / ".cache" / "euphony-local"
+EUPHONY_LOCAL_CACHE_DIR = Path.home() / ".cache" / "codex-spelunker"
 CODEX_METADATA_REFRESH_SECONDS = int(
     os.environ.get("EUPHONY_LOCAL_METADATA_REFRESH_SECONDS", "300")
 )
@@ -2413,7 +2413,7 @@ async def _translate_singleflight(source_text: str) -> TranslationResult:
         _inflight_translations.pop(key, None)
 
 
-fastapi_app = FastAPI(title="Euphony")
+fastapi_app = FastAPI(title="Codex Spelunker")
 
 
 @fastapi_app.get("/ping/")
@@ -2440,7 +2440,7 @@ async def get_blob_jsonl(
         )
 
     headers = {
-        "User-Agent": "euphony/1.0",
+        "User-Agent": "codex-spelunker/1.0",
         "Accept": "application/json, application/x-ndjson, text/plain;q=0.9, */*;q=0.1",
     }
     if noCache:
