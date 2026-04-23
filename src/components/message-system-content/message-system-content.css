@@ -1,0 +1,28 @@
+@import '../../css/message-collapse.css';
+@import '../../css/message-markdown.css';
+@import '../../css/message-config-table.css';
+@import '../../css/message-content-default.css';
+
+.message-content {
+  gap: 10px;
+  padding-right: var(--multimodal-message-content-padding-h);
+  padding-left: var(--multimodal-message-content-padding-h);
+}
+
+.content-block {
+  color: var(--font-color);
+}
+
+.message-text[contenteditable] {
+  padding: 2px;
+  margin: 3px 2px;
+  width: auto;
+  outline: 2px solid var(--message-text-outline-color, var(--blue-100));
+  outline-style: var(--message-text-outline-style, solid);
+  border-radius: 2px;
+  transition: outline-color 150ms;
+
+  &:focus {
+    outline-color: var(--blue-500);
+  }
+}

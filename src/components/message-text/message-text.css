@@ -1,0 +1,39 @@
+@import '../../css/message-markdown.css';
+@import '../../css/message-content-default.css';
+
+.message-content {
+  position: relative;
+
+  &[is-translation] {
+    .message-text {
+      color: var(--translation-color);
+    }
+  }
+}
+
+.message-text {
+  color: var(--font-color);
+  word-break: break-word;
+  white-space: pre-wrap;
+  width: 100%;
+  max-height: var(--max-message-height);
+  overflow-y: auto;
+
+  &[markdown-rendered] {
+    white-space: normal;
+  }
+}
+
+.message-text[contenteditable] {
+  padding: 2px;
+  margin: 3px 2px;
+  width: auto;
+  outline: 2px solid var(--message-text-outline-color, var(--blue-100));
+  outline-style: var(--message-text-outline-style, solid);
+  border-radius: 2px;
+  transition: outline-color 150ms;
+
+  &:focus {
+    outline-color: var(--blue-500);
+  }
+}

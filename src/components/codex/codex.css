@@ -1,0 +1,94 @@
+@import '../../css/component-global.css';
+
+:host {
+  display: block;
+  width: 100%;
+}
+
+.codex-wrapper {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.empty-state {
+  color: var(--gray-600);
+  font-style: italic;
+  padding: 16px;
+}
+
+.session-toolbar {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid var(--gray-300);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fafc 100%);
+}
+
+.session-toolbar-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.session-toolbar-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--gray-900);
+}
+
+.session-toolbar-count {
+  font-size: 0.85rem;
+  color: var(--gray-600);
+}
+
+.session-toolbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.session-toolbar-subsection {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.session-toolbar-subtitle {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--gray-600);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.session-toolbar-controls sl-input {
+  width: min(320px, 100%);
+}
+
+.session-toolbar-button {
+  appearance: none;
+  border: 1px solid var(--gray-300);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: white;
+  color: var(--gray-700);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.session-toolbar-button[is-active] {
+  border-color: var(--blue-300);
+  background: var(--blue-50);
+  color: var(--blue-800);
+}
+
+.session-toolbar-button-secondary {
+  margin-left: auto;
+}

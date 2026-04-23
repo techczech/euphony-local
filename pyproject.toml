@@ -1,0 +1,28 @@
+[project]
+name = "euphony-local"
+version = "0.1.0"
+# Main dependencies for the euphony FastAPI server.
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "async-lru",
+  "openai",
+  "pydantic",
+  "jmespath",
+  "openai-harmony",
+]
+
+
+[tool.ruff.lint]
+extend-select = ["ANN2"]
+
+[tool.setuptools.packages.find]
+include = ["euphony*"]
+
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+strict = true
+local_partial_types = true

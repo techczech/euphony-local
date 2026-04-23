@@ -1,0 +1,36 @@
+@import '../../css/message-collapse.css';
+@import '../../css/message-content-default.css';
+
+.message-content {
+  gap: 8px;
+  padding-right: var(--multimodal-message-content-padding-h);
+  padding-left: var(--multimodal-message-content-padding-h);
+}
+
+.content-block {
+  color: var(--font-color);
+}
+
+.error-label {
+  color: var(--theme-pink-800);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+pre.message-pre {
+  padding: 0;
+  margin: 0;
+  font-size: 0.9em;
+  color: var(--font-color);
+  width: 100%;
+  background-color: transparent;
+  background: transparent;
+  word-break: break-word;
+  white-space: pre-wrap;
+
+  & code {
+    background-color: transparent;
+    background: transparent;
+  }
+}

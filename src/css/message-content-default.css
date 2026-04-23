@@ -1,0 +1,13 @@
+.message-content {
+  background-color: var(--conv-background-color);
+  line-height: var(--message-content-line-height);
+  padding: var(--message-content-padding);
+  border: var(--message-content-border);
+  border-left: var(--message-content-border-left);
+  border-radius: var(--message-content-border-radius);
+
+  box-sizing: border-box;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
