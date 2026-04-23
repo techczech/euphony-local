@@ -1,4 +1,5 @@
 import asyncio
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -44,6 +45,9 @@ QMD_BIN = Path(os.environ.get("QMD_BIN", "/opt/homebrew/bin/qmd")).expanduser()
 QMD_CODEX_INDEX_NAME = "euphony-local-codex"
 QMD_CODEX_COLLECTION = "codex-sessions-local"
 EUPHONY_LOCAL_CACHE_DIR = Path.home() / ".cache" / "euphony-local"
+CODEX_METADATA_REFRESH_SECONDS = int(
+    os.environ.get("EUPHONY_LOCAL_METADATA_REFRESH_SECONDS", "300")
+)
 HARMONY_RENDERER_NAME = "o200k_harmony"
 HARMONY_RENDERING_ENCODING = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 HARMONY_RENDER_CONFIG = RenderConversationConfig(auto_drop_analysis=False)
@@ -75,6 +79,7 @@ class BlobJSONLResponse(BaseModel):
     isFiltered: bool
     matchedCount: int
     resolvedURL: str
+    stats: dict[str, Any] | None = None
 
 
 class HarmonyRendererListResult(BaseModel):
@@ -824,12 +829,198 @@ def _resolve_local_codex_path(kind: str, base_dir: str | None) -> tuple[Path, st
     return target, f"local-codex://{target}"
 
 
-def _path_to_project_parts(cwd: str | None) -> tuple[str | None, str | None]:
-    if not cwd:
-        return None, None
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    normalized = stripped.replace("Z", "+00:00") if stripped.endswith("Z") else stripped
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
-    cwd_path = Path(cwd)
-    return cwd_path.name or None, str(cwd_path.parent) if cwd_path.parent else None
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _to_local_day_string(value: str | None) -> str | None:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone().date().isoformat()
+
+
+def _parse_date_value(value: str | None, *, label: str) -> date | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return date.fromisoformat(stripped)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be in YYYY-MM-DD format.",
+        ) from exc
+
+
+def _resolve_time_filter_bounds(
+    *,
+    day: str,
+    time_range: str,
+    date_from: str,
+    date_to: str,
+) -> tuple[date | None, date | None]:
+    start_date: date | None = None
+    end_date: date | None = None
+
+    if day.strip():
+        parsed_day = _parse_date_value(day, label="day")
+        start_date = parsed_day
+        end_date = parsed_day
+    elif time_range.strip():
+        today = datetime.now().astimezone().date()
+        normalized = time_range.strip().lower()
+        if normalized == "today":
+            start_date = today
+            end_date = today
+        elif normalized == "yesterday":
+            start_date = today - timedelta(days=1)
+            end_date = start_date
+        elif normalized in {"last7days", "last_7_days", "last7"}:
+            start_date = today - timedelta(days=6)
+            end_date = today
+        elif normalized in {"last30days", "last_30_days", "last30"}:
+            start_date = today - timedelta(days=29)
+            end_date = today
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "timeRange must be one of: today, yesterday, last7days, last30days."
+                ),
+            )
+
+    explicit_from = _parse_date_value(date_from, label="dateFrom")
+    explicit_to = _parse_date_value(date_to, label="dateTo")
+
+    if explicit_from:
+        start_date = explicit_from if start_date is None else max(start_date, explicit_from)
+    if explicit_to:
+        end_date = explicit_to if end_date is None else min(end_date, explicit_to)
+
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="dateFrom/day must be on or before dateTo.",
+        )
+
+    return start_date, end_date
+
+
+def _session_date_in_range(
+    item: dict[str, Any],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+) -> bool:
+    if start_date is None and end_date is None:
+        return True
+
+    activity_date_value = item.get("activity_date")
+    if isinstance(activity_date_value, str) and activity_date_value:
+        try:
+            session_day = date.fromisoformat(activity_date_value)
+        except ValueError:
+            session_day = None
+    else:
+        session_day = None
+
+    if session_day is None:
+        session_day = _parse_date_value(
+            _to_local_day_string(
+                str(item.get("ended_at") or item.get("updated_at") or item.get("started_at") or "")
+            ),
+            label="activity_date",
+        )
+
+    if session_day is None:
+        return False
+
+    if start_date and session_day < start_date:
+        return False
+    if end_date and session_day > end_date:
+        return False
+    return True
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _max_int(*values: Any) -> int | None:
+    ints = [value for value in (_coerce_int(item) for item in values) if value is not None]
+    return max(ints) if ints else None
+
+
+def _infer_project_context(cwd: str | None) -> dict[str, str | None]:
+    if not cwd:
+        return {
+            "project_name": None,
+            "folder_path": None,
+            "top_level_folder": None,
+            "parent_folder_path": None,
+        }
+
+    cwd_path = Path(cwd).expanduser()
+    parts = cwd_path.parts
+
+    def build_root_path(end_index: int) -> str | None:
+        if end_index <= 0:
+            return None
+        return str(Path(*parts[:end_index]))
+
+    project_name = cwd_path.name or None
+    folder_path = str(cwd_path)
+    top_level_folder = cwd_path.parent.name or None
+    parent_folder_path = str(cwd_path.parent) if cwd_path.parent else None
+
+    if "gitrepos" in parts:
+        gitrepos_index = parts.index("gitrepos")
+        if len(parts) > gitrepos_index + 2:
+            top_level_folder = parts[gitrepos_index + 1]
+            project_name = parts[gitrepos_index + 2]
+            folder_path = build_root_path(gitrepos_index + 3) or folder_path
+            parent_folder_path = build_root_path(gitrepos_index + 2)
+    elif "_vibecoding" in parts:
+        vibecoding_index = parts.index("_vibecoding")
+        if len(parts) > vibecoding_index + 1:
+            top_level_folder = parts[vibecoding_index]
+            project_name = parts[vibecoding_index + 1]
+            folder_path = build_root_path(vibecoding_index + 2) or folder_path
+            parent_folder_path = build_root_path(vibecoding_index + 1)
+
+    return {
+        "project_name": project_name,
+        "folder_path": folder_path,
+        "top_level_folder": top_level_folder,
+        "parent_folder_path": parent_folder_path,
+    }
+
+
+def _path_to_project_parts(cwd: str | None) -> tuple[str | None, str | None]:
+    context = _infer_project_context(cwd)
+    return context["project_name"], context["folder_path"]
 
 
 def _project_name_from_repository_url(repository_url: str | None) -> str | None:
@@ -993,7 +1184,9 @@ def _extract_session_jsonl_summary_context(
     ):
         repository_url = top_level_meta["git"]["repository_url"]
 
-    project_name, folder_path = _path_to_project_parts(cwd)
+    project_context = _infer_project_context(cwd)
+    project_name = project_context["project_name"]
+    folder_path = project_context["folder_path"]
     if not project_name:
         project_name = _project_name_from_repository_url(repository_url)
     if not folder_path:
@@ -1018,7 +1211,197 @@ def _extract_session_jsonl_summary_context(
         "cwd": cwd,
         "project_name": project_name,
         "folder_path": folder_path,
+        "top_level_folder": project_context["top_level_folder"],
+        "parent_folder_path": project_context["parent_folder_path"],
         "repository_url": repository_url,
+    }
+
+
+def _extract_jsonl_activity_metrics(lines: list[dict[str, Any]]) -> dict[str, Any]:
+    earliest_ts: datetime | None = None
+    latest_ts: datetime | None = None
+    usage_totals: dict[str, int | None] = {
+        "input_tokens": None,
+        "cached_input_tokens": None,
+        "output_tokens": None,
+        "reasoning_output_tokens": None,
+        "total_tokens": None,
+    }
+    best_total_tokens = -1
+    metrics = {
+        "user_message_count": 0,
+        "assistant_message_count": 0,
+        "tool_call_count": 0,
+        "tool_output_count": 0,
+        "agent_event_count": 0,
+        "commentary_event_count": 0,
+        "reasoning_item_count": 0,
+        "event_msg_count": 0,
+        "response_item_count": 0,
+    }
+
+    def register_timestamp(raw_value: Any) -> None:
+        nonlocal earliest_ts, latest_ts
+        if not isinstance(raw_value, str):
+            return
+        parsed = _parse_iso_datetime(raw_value)
+        if parsed is None:
+            return
+        earliest_ts = parsed if earliest_ts is None or parsed < earliest_ts else earliest_ts
+        latest_ts = parsed if latest_ts is None or parsed > latest_ts else latest_ts
+
+    def register_token_usage(payload: dict[str, Any]) -> None:
+        nonlocal best_total_tokens, usage_totals
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return
+        total_usage = info.get("total_token_usage")
+        if not isinstance(total_usage, dict):
+            return
+        total_tokens = _coerce_int(total_usage.get("total_tokens"))
+        candidate_score = total_tokens if total_tokens is not None else -1
+        if candidate_score < best_total_tokens:
+            return
+        best_total_tokens = candidate_score
+        usage_totals = {
+            "input_tokens": _coerce_int(total_usage.get("input_tokens")),
+            "cached_input_tokens": _coerce_int(total_usage.get("cached_input_tokens")),
+            "output_tokens": _coerce_int(total_usage.get("output_tokens")),
+            "reasoning_output_tokens": _coerce_int(
+                total_usage.get("reasoning_output_tokens")
+            ),
+            "total_tokens": total_tokens,
+        }
+
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        register_timestamp(line.get("timestamp"))
+        line_type = line.get("type")
+        payload = line.get("payload")
+
+        if line_type == "message":
+            role = line.get("role")
+            content = line.get("content")
+            has_visible_text = True
+            if role == "user" and isinstance(content, list):
+                texts = [
+                    str(part.get("text")).strip()
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ]
+                has_visible_text = any(
+                    text and not _is_injected_wrapper_text(text) for text in texts
+                )
+            if role == "user" and has_visible_text:
+                metrics["user_message_count"] += 1
+            elif role == "assistant":
+                metrics["assistant_message_count"] += 1
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        if line_type == "response_item":
+            metrics["response_item_count"] += 1
+            payload_type = payload.get("type")
+            if payload_type == "message":
+                role = payload.get("role")
+                content = payload.get("content")
+                has_visible_text = True
+                if role == "user" and isinstance(content, list):
+                    texts = [
+                        str(part.get("text")).strip()
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    ]
+                    has_visible_text = any(
+                        text and not _is_injected_wrapper_text(text) for text in texts
+                    )
+                if role == "user" and has_visible_text:
+                    metrics["user_message_count"] += 1
+                elif role == "assistant":
+                    metrics["assistant_message_count"] += 1
+            elif payload_type == "function_call":
+                metrics["tool_call_count"] += 1
+            elif payload_type == "function_call_output":
+                metrics["tool_output_count"] += 1
+            elif isinstance(payload_type, str) and "reason" in payload_type:
+                metrics["reasoning_item_count"] += 1
+            continue
+
+        if line_type == "event_msg":
+            metrics["event_msg_count"] += 1
+            payload_type = payload.get("type")
+            if payload_type == "token_count":
+                register_token_usage(payload)
+            elif payload_type == "user_message" and isinstance(payload.get("message"), str):
+                if not _is_injected_wrapper_text(payload["message"]):
+                    metrics["user_message_count"] += 1
+            elif payload_type == "agent_message":
+                metrics["agent_event_count"] += 1
+                if payload.get("phase") == "commentary":
+                    metrics["commentary_event_count"] += 1
+            elif isinstance(payload_type, str) and "reason" in payload_type:
+                metrics["reasoning_item_count"] += 1
+
+    started_at = earliest_ts.isoformat().replace("+00:00", "Z") if earliest_ts else None
+    ended_at = latest_ts.isoformat().replace("+00:00", "Z") if latest_ts else None
+    activity_date = _to_local_day_string(ended_at or started_at)
+    return {
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "activity_date": activity_date,
+        **usage_totals,
+        **metrics,
+    }
+
+
+def _extract_legacy_activity_metrics(
+    session_data: dict[str, Any],
+    *,
+    updated_at: str | None,
+) -> dict[str, Any]:
+    session_meta = session_data.get("session")
+    items = session_data.get("items")
+    started_at = session_meta.get("timestamp") if isinstance(session_meta, dict) else None
+    metrics = {
+        "user_message_count": 0,
+        "assistant_message_count": 0,
+        "tool_call_count": 0,
+        "tool_output_count": 0,
+        "agent_event_count": 0,
+        "commentary_event_count": 0,
+        "reasoning_item_count": 0,
+        "event_msg_count": 0,
+        "response_item_count": 0,
+    }
+
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            if role == "user":
+                text = _extract_legacy_message_text(item)
+                if text:
+                    metrics["user_message_count"] += 1
+            elif role == "assistant":
+                text = _extract_legacy_message_text(item)
+                if text:
+                    metrics["assistant_message_count"] += 1
+
+    effective_end = updated_at or started_at
+    return {
+        "started_at": started_at,
+        "ended_at": effective_end,
+        "activity_date": _to_local_day_string(effective_end or started_at),
+        "input_tokens": None,
+        "cached_input_tokens": None,
+        "output_tokens": None,
+        "reasoning_output_tokens": None,
+        "total_tokens": None,
+        **metrics,
     }
 
 
@@ -1074,6 +1457,7 @@ def _collect_local_codex_projects(
     summaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     project_map: dict[tuple[str, str], dict[str, Any]] = {}
+    today = datetime.now().astimezone().date()
     for item in summaries:
         project_name = item.get("project_name")
         folder_path = item.get("folder_path")
@@ -1086,12 +1470,91 @@ def _collect_local_codex_projects(
                 "entry_type": "codex_project_summary",
                 "project_name": project_name,
                 "folder_path": folder_path,
+                "top_level_folder": item.get("top_level_folder"),
+                "parent_folder_path": item.get("parent_folder_path"),
+                "display_folder": folder_path,
+                "repo_folder": project_name,
+                "relative_folder": (
+                    f"{item.get('top_level_folder')}/{project_name}"
+                    if isinstance(item.get("top_level_folder"), str)
+                    and item.get("top_level_folder")
+                    else project_name
+                ),
                 "session_count": 0,
+                "first_activity_at": None,
+                "last_activity_at": None,
+                "activity_date_start": None,
+                "activity_date_end": None,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0,
+                "user_message_count": 0,
+                "assistant_message_count": 0,
+                "tool_call_count": 0,
+                "tool_output_count": 0,
+                "active_days": 0,
+                "session_count_7d": 0,
+                "session_count_30d": 0,
+                "_active_days": set(),
             }
-        project_map[key]["session_count"] += 1
+        project_entry = project_map[key]
+        project_entry["session_count"] += 1
+
+        for timestamp_key, target_key, chooser in (
+            ("started_at", "first_activity_at", min),
+            ("ended_at", "last_activity_at", max),
+            ("activity_date", "activity_date_start", min),
+            ("activity_date", "activity_date_end", max),
+        ):
+            raw_value = item.get(timestamp_key)
+            if not isinstance(raw_value, str) or not raw_value:
+                continue
+            existing = project_entry.get(target_key)
+            if not isinstance(existing, str) or not existing:
+                project_entry[target_key] = raw_value
+            else:
+                project_entry[target_key] = chooser(existing, raw_value)
+
+        for numeric_key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+            "user_message_count",
+            "assistant_message_count",
+            "tool_call_count",
+            "tool_output_count",
+        ):
+            project_entry[numeric_key] += _coerce_int(item.get(numeric_key)) or 0
+
+        activity_date = item.get("activity_date")
+        if isinstance(activity_date, str) and activity_date:
+            project_entry["_active_days"].add(activity_date)
+            try:
+                parsed_day = date.fromisoformat(activity_date)
+            except ValueError:
+                parsed_day = None
+            if parsed_day is not None:
+                if parsed_day >= today - timedelta(days=6):
+                    project_entry["session_count_7d"] += 1
+                if parsed_day >= today - timedelta(days=29):
+                    project_entry["session_count_30d"] += 1
 
     projects = list(project_map.values())
-    projects.sort(key=lambda item: (-int(item["session_count"]), str(item["project_name"])))
+    for item in projects:
+        active_days = item.pop("_active_days", set())
+        item["active_days"] = len(active_days)
+    projects.sort(
+        key=lambda item: (
+            -int(item["session_count"]),
+            str(item.get("last_activity_at") or ""),
+            str(item["project_name"]),
+        ),
+        reverse=False,
+    )
     return projects
 
 
@@ -1112,14 +1575,73 @@ def _initialize_codex_metadata_db(connection: sqlite3.Connection) -> None:
             session_id TEXT NOT NULL,
             thread_name TEXT,
             updated_at TEXT,
+            started_at TEXT,
+            ended_at TEXT,
+            activity_date TEXT,
             cwd TEXT,
             project_name TEXT,
             folder_path TEXT,
+            top_level_folder TEXT,
+            parent_folder_path TEXT,
             first_user_text TEXT,
+            input_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_output_tokens INTEGER,
+            total_tokens INTEGER,
+            user_message_count INTEGER,
+            assistant_message_count INTEGER,
+            tool_call_count INTEGER,
+            tool_output_count INTEGER,
+            agent_event_count INTEGER,
+            commentary_event_count INTEGER,
+            reasoning_item_count INTEGER,
+            event_msg_count INTEGER,
+            response_item_count INTEGER,
             open_blob_url TEXT NOT NULL,
             PRIMARY KEY (source_kind, session_id)
         )
         """
+    )
+    existing_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    required_columns = {
+        "started_at": "TEXT",
+        "ended_at": "TEXT",
+        "activity_date": "TEXT",
+        "top_level_folder": "TEXT",
+        "parent_folder_path": "TEXT",
+        "input_tokens": "INTEGER",
+        "cached_input_tokens": "INTEGER",
+        "output_tokens": "INTEGER",
+        "reasoning_output_tokens": "INTEGER",
+        "total_tokens": "INTEGER",
+        "user_message_count": "INTEGER",
+        "assistant_message_count": "INTEGER",
+        "tool_call_count": "INTEGER",
+        "tool_output_count": "INTEGER",
+        "agent_event_count": "INTEGER",
+        "commentary_event_count": "INTEGER",
+        "reasoning_item_count": "INTEGER",
+        "event_msg_count": "INTEGER",
+        "response_item_count": "INTEGER",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name in existing_columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE sessions ADD COLUMN {column_name} {column_type}"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_activity_date ON sessions(activity_date)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_project_name ON sessions(project_name)"
     )
     connection.commit()
 
@@ -1139,36 +1661,42 @@ def _scan_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]:
     if archived_dir.exists():
         for path in sorted(archived_dir.glob("*.jsonl"), reverse=True):
             lines = _load_archived_session_lines(path)
-            session_meta = next(
-                (
-                    line.get("payload")
-                    for line in lines
-                    if line.get("type") == "session_meta"
-                    and isinstance(line.get("payload"), dict)
-                ),
-                {},
-            )
-            cwd = session_meta.get("cwd") if isinstance(session_meta, dict) else None
-            project_name, folder_path = _path_to_project_parts(cwd)
+            summary_context = _extract_session_jsonl_summary_context(lines, path)
+            activity_metrics = _extract_jsonl_activity_metrics(lines)
             first_user_text = _extract_first_user_text_from_archived(lines)
-            session_id = (
-                session_meta.get("id")
-                if isinstance(session_meta, dict) and isinstance(session_meta.get("id"), str)
-                else path.stem
-            )
+            session_id = summary_context["session_id"]
             summaries.append(
                 {
                     "entry_type": "codex_session_summary",
                     "source_kind": "archived",
                     "session_id": session_id,
                     "thread_name": _clean_session_title(
-                        first_user_text or project_name or "Archived session"
+                        first_user_text or summary_context["project_name"] or "Archived session"
                     ),
-                    "updated_at": session_meta.get("timestamp"),
-                    "cwd": cwd,
-                    "project_name": project_name,
-                    "folder_path": folder_path,
+                    "updated_at": summary_context["updated_at"] or activity_metrics["ended_at"],
+                    "started_at": activity_metrics["started_at"],
+                    "ended_at": activity_metrics["ended_at"],
+                    "activity_date": activity_metrics["activity_date"],
+                    "cwd": summary_context["cwd"],
+                    "project_name": summary_context["project_name"],
+                    "folder_path": summary_context["folder_path"],
+                    "top_level_folder": summary_context["top_level_folder"],
+                    "parent_folder_path": summary_context["parent_folder_path"],
                     "first_user_text": first_user_text,
+                    "input_tokens": activity_metrics["input_tokens"],
+                    "cached_input_tokens": activity_metrics["cached_input_tokens"],
+                    "output_tokens": activity_metrics["output_tokens"],
+                    "reasoning_output_tokens": activity_metrics["reasoning_output_tokens"],
+                    "total_tokens": activity_metrics["total_tokens"],
+                    "user_message_count": activity_metrics["user_message_count"],
+                    "assistant_message_count": activity_metrics["assistant_message_count"],
+                    "tool_call_count": activity_metrics["tool_call_count"],
+                    "tool_output_count": activity_metrics["tool_output_count"],
+                    "agent_event_count": activity_metrics["agent_event_count"],
+                    "commentary_event_count": activity_metrics["commentary_event_count"],
+                    "reasoning_item_count": activity_metrics["reasoning_item_count"],
+                    "event_msg_count": activity_metrics["event_msg_count"],
+                    "response_item_count": activity_metrics["response_item_count"],
                     "open_blob_url": (
                         "local-codex:///session-open?"
                         + urllib.parse.urlencode(
@@ -1194,6 +1722,18 @@ def _scan_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]:
                 else ""
             )
             session_id = session_meta.get("id", path.stem)
+            updated_at = (
+                session_index_map.get(session_id, {}).get("updated_at")
+                if isinstance(session_id, str)
+                and isinstance(
+                    session_index_map.get(session_id, {}).get("updated_at"), str
+                )
+                else session_meta.get("timestamp")
+            )
+            activity_metrics = _extract_legacy_activity_metrics(
+                session_data,
+                updated_at=updated_at,
+            )
             summaries.append(
                 {
                     "entry_type": "codex_session_summary",
@@ -1202,18 +1742,30 @@ def _scan_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]:
                     "thread_name": _clean_session_title(
                         first_user_text or "Untitled session"
                     ),
-                    "updated_at": (
-                        session_index_map.get(session_id, {}).get("updated_at")
-                        if isinstance(session_id, str)
-                        and isinstance(
-                            session_index_map.get(session_id, {}).get("updated_at"), str
-                        )
-                        else session_meta.get("timestamp")
-                    ),
+                    "updated_at": updated_at,
+                    "started_at": activity_metrics["started_at"],
+                    "ended_at": activity_metrics["ended_at"],
+                    "activity_date": activity_metrics["activity_date"],
                     "cwd": None,
                     "project_name": None,
                     "folder_path": None,
+                    "top_level_folder": None,
+                    "parent_folder_path": None,
                     "first_user_text": first_user_text,
+                    "input_tokens": activity_metrics["input_tokens"],
+                    "cached_input_tokens": activity_metrics["cached_input_tokens"],
+                    "output_tokens": activity_metrics["output_tokens"],
+                    "reasoning_output_tokens": activity_metrics["reasoning_output_tokens"],
+                    "total_tokens": activity_metrics["total_tokens"],
+                    "user_message_count": activity_metrics["user_message_count"],
+                    "assistant_message_count": activity_metrics["assistant_message_count"],
+                    "tool_call_count": activity_metrics["tool_call_count"],
+                    "tool_output_count": activity_metrics["tool_output_count"],
+                    "agent_event_count": activity_metrics["agent_event_count"],
+                    "commentary_event_count": activity_metrics["commentary_event_count"],
+                    "reasoning_item_count": activity_metrics["reasoning_item_count"],
+                    "event_msg_count": activity_metrics["event_msg_count"],
+                    "response_item_count": activity_metrics["response_item_count"],
                     "open_blob_url": (
                         "local-codex:///session-open?"
                         + urllib.parse.urlencode(
@@ -1233,6 +1785,7 @@ def _scan_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]:
                 continue
 
             summary_context = _extract_session_jsonl_summary_context(lines, path)
+            activity_metrics = _extract_jsonl_activity_metrics(lines)
             session_id = summary_context["session_id"]
             project_name = summary_context["project_name"]
             first_user_text = _extract_first_user_text_from_archived(lines)
@@ -1250,12 +1803,31 @@ def _scan_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]:
                         and isinstance(
                             session_index_map.get(session_id, {}).get("updated_at"), str
                         )
-                        else summary_context["updated_at"]
+                        else summary_context["updated_at"] or activity_metrics["ended_at"]
                     ),
+                    "started_at": activity_metrics["started_at"],
+                    "ended_at": activity_metrics["ended_at"],
+                    "activity_date": activity_metrics["activity_date"],
                     "cwd": summary_context["cwd"],
                     "project_name": project_name,
                     "folder_path": summary_context["folder_path"],
+                    "top_level_folder": summary_context["top_level_folder"],
+                    "parent_folder_path": summary_context["parent_folder_path"],
                     "first_user_text": first_user_text,
+                    "input_tokens": activity_metrics["input_tokens"],
+                    "cached_input_tokens": activity_metrics["cached_input_tokens"],
+                    "output_tokens": activity_metrics["output_tokens"],
+                    "reasoning_output_tokens": activity_metrics["reasoning_output_tokens"],
+                    "total_tokens": activity_metrics["total_tokens"],
+                    "user_message_count": activity_metrics["user_message_count"],
+                    "assistant_message_count": activity_metrics["assistant_message_count"],
+                    "tool_call_count": activity_metrics["tool_call_count"],
+                    "tool_output_count": activity_metrics["tool_output_count"],
+                    "agent_event_count": activity_metrics["agent_event_count"],
+                    "commentary_event_count": activity_metrics["commentary_event_count"],
+                    "reasoning_item_count": activity_metrics["reasoning_item_count"],
+                    "event_msg_count": activity_metrics["event_msg_count"],
+                    "response_item_count": activity_metrics["response_item_count"],
                     "open_blob_url": (
                         "local-codex:///session-open?"
                         + urllib.parse.urlencode(
@@ -1288,14 +1860,19 @@ def _collect_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         _initialize_codex_metadata_db(connection)
-        stored_signature_row = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'signature'"
-        ).fetchone()
-        stored_signature = (
-            str(stored_signature_row["value"]) if stored_signature_row else None
+        metadata_rows = {
+            str(row["key"]): row["value"]
+            for row in connection.execute("SELECT key, value FROM metadata").fetchall()
+        }
+        stored_signature = str(metadata_rows["signature"]) if "signature" in metadata_rows else None
+        refreshed_at = _parse_iso_datetime(
+            str(metadata_rows["refreshed_at"]) if "refreshed_at" in metadata_rows else None
+        )
+        refresh_deadline = datetime.now(timezone.utc) - timedelta(
+            seconds=CODEX_METADATA_REFRESH_SECONDS
         )
 
-        if stored_signature != current_signature:
+        if stored_signature != current_signature or refreshed_at is None or refreshed_at <= refresh_deadline:
             summaries = _scan_local_codex_summaries(base_dir)
             connection.execute("DELETE FROM sessions")
             connection.executemany(
@@ -1306,12 +1883,31 @@ def _collect_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]
                     session_id,
                     thread_name,
                     updated_at,
+                    started_at,
+                    ended_at,
+                    activity_date,
                     cwd,
                     project_name,
                     folder_path,
+                    top_level_folder,
+                    parent_folder_path,
                     first_user_text,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    total_tokens,
+                    user_message_count,
+                    assistant_message_count,
+                    tool_call_count,
+                    tool_output_count,
+                    agent_event_count,
+                    commentary_event_count,
+                    reasoning_item_count,
+                    event_msg_count,
+                    response_item_count,
                     open_blob_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -1320,18 +1916,40 @@ def _collect_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]
                         summary.get("session_id"),
                         summary.get("thread_name"),
                         summary.get("updated_at"),
+                        summary.get("started_at"),
+                        summary.get("ended_at"),
+                        summary.get("activity_date"),
                         summary.get("cwd"),
                         summary.get("project_name"),
                         summary.get("folder_path"),
+                        summary.get("top_level_folder"),
+                        summary.get("parent_folder_path"),
                         summary.get("first_user_text"),
+                        summary.get("input_tokens"),
+                        summary.get("cached_input_tokens"),
+                        summary.get("output_tokens"),
+                        summary.get("reasoning_output_tokens"),
+                        summary.get("total_tokens"),
+                        summary.get("user_message_count"),
+                        summary.get("assistant_message_count"),
+                        summary.get("tool_call_count"),
+                        summary.get("tool_output_count"),
+                        summary.get("agent_event_count"),
+                        summary.get("commentary_event_count"),
+                        summary.get("reasoning_item_count"),
+                        summary.get("event_msg_count"),
+                        summary.get("response_item_count"),
                         summary.get("open_blob_url"),
                     )
                     for summary in summaries
                 ],
             )
-            connection.execute(
-                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('signature', ?)",
-                (current_signature,),
+            connection.executemany(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                [
+                    ("signature", current_signature),
+                    ("refreshed_at", _utcnow_iso()),
+                ],
             )
             connection.commit()
 
@@ -1343,17 +1961,54 @@ def _collect_local_codex_summaries(base_dir: str | None) -> list[dict[str, Any]]
                 session_id,
                 thread_name,
                 updated_at,
+                started_at,
+                ended_at,
+                activity_date,
                 cwd,
                 project_name,
                 folder_path,
+                top_level_folder,
+                parent_folder_path,
                 first_user_text,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens,
+                user_message_count,
+                assistant_message_count,
+                tool_call_count,
+                tool_output_count,
+                agent_event_count,
+                commentary_event_count,
+                reasoning_item_count,
+                event_msg_count,
+                response_item_count,
                 open_blob_url
             FROM sessions
             ORDER BY COALESCE(updated_at, '') DESC
             """
         ).fetchall()
 
-    return [dict(row) for row in rows]
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        project_name = item.get("project_name")
+        folder_path = item.get("folder_path")
+        top_level_folder = item.get("top_level_folder")
+        item["repo_folder"] = project_name if isinstance(project_name, str) else None
+        item["display_folder"] = folder_path if isinstance(folder_path, str) else None
+        item["relative_folder"] = (
+            f"{top_level_folder}/{project_name}"
+            if isinstance(top_level_folder, str)
+            and top_level_folder
+            and isinstance(project_name, str)
+            and project_name
+            else project_name
+        )
+        summaries.append(item)
+
+    return summaries
 
 
 def _filter_local_codex_summaries(
@@ -1362,9 +2017,20 @@ def _filter_local_codex_summaries(
     search_query: str,
     project_query: str,
     folder_query: str,
+    day: str,
+    time_range: str,
+    date_from: str,
+    date_to: str,
 ) -> list[dict[str, Any]]:
     has_explicit_filters = any(
-        value.strip() for value in (search_query, project_query, folder_query)
+        value.strip()
+        for value in (search_query, project_query, folder_query, day, time_range, date_from, date_to)
+    )
+    start_date, end_date = _resolve_time_filter_bounds(
+        day=day,
+        time_range=time_range,
+        date_from=date_from,
+        date_to=date_to,
     )
 
     def is_hidden_by_default(item: dict[str, Any]) -> bool:
@@ -1377,6 +2043,11 @@ def _filter_local_codex_summaries(
     filtered = (
         data if has_explicit_filters else [item for item in data if not is_hidden_by_default(item)]
     )
+    filtered = [
+        item
+        for item in filtered
+        if _session_date_in_range(item, start_date=start_date, end_date=end_date)
+    ]
 
     if search_query.strip():
         q = search_query.strip().lower()
@@ -1389,6 +2060,8 @@ def _filter_local_codex_summaries(
                 item.get("first_user_text"),
                 item.get("project_name"),
                 item.get("folder_path"),
+                item.get("top_level_folder"),
+                item.get("parent_folder_path"),
             ]
             return any(isinstance(field, str) and q in field.lower() for field in fields)
 
@@ -1413,6 +2086,119 @@ def _filter_local_codex_summaries(
         ]
 
     return filtered
+
+
+def _collect_local_codex_usage_stats(
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    day_map: dict[str, dict[str, Any]] = {}
+    for item in summaries:
+        day_value = item.get("activity_date")
+        if not isinstance(day_value, str) or not day_value:
+            continue
+        if day_value not in day_map:
+            day_map[day_value] = {
+                "entry_type": "codex_usage_day",
+                "day": day_value,
+                "session_count": 0,
+                "active_project_count": 0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0,
+                "user_message_count": 0,
+                "assistant_message_count": 0,
+                "tool_call_count": 0,
+                "tool_output_count": 0,
+                "agent_event_count": 0,
+                "commentary_event_count": 0,
+                "reasoning_item_count": 0,
+                "event_msg_count": 0,
+                "response_item_count": 0,
+                "_projects": set(),
+            }
+        day_entry = day_map[day_value]
+        day_entry["session_count"] += 1
+        project_name = item.get("project_name")
+        if isinstance(project_name, str) and project_name:
+            day_entry["_projects"].add(project_name)
+
+        for numeric_key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+            "user_message_count",
+            "assistant_message_count",
+            "tool_call_count",
+            "tool_output_count",
+            "agent_event_count",
+            "commentary_event_count",
+            "reasoning_item_count",
+            "event_msg_count",
+            "response_item_count",
+        ):
+            day_entry[numeric_key] += _coerce_int(item.get(numeric_key)) or 0
+
+    usage_days = list(day_map.values())
+    for item in usage_days:
+        projects = item.pop("_projects", set())
+        item["active_project_count"] = len(projects)
+    usage_days.sort(key=lambda item: str(item.get("day") or ""))
+    return usage_days
+
+
+def _build_local_codex_stats_payload(
+    summaries: list[dict[str, Any]],
+    projects: list[dict[str, Any]],
+    usage_days: list[dict[str, Any]],
+    *,
+    period_label: str,
+) -> dict[str, Any]:
+    total_tokens = sum(_coerce_int(item.get("total_tokens")) or 0 for item in summaries)
+    total_messages = sum(
+        (_coerce_int(item.get("user_message_count")) or 0)
+        + (_coerce_int(item.get("assistant_message_count")) or 0)
+        for item in summaries
+    )
+    total_tool_calls = sum(
+        _coerce_int(item.get("tool_call_count")) or 0 for item in summaries
+    )
+    active_days = len(
+        {
+            item.get("activity_date")
+            for item in summaries
+            if isinstance(item.get("activity_date"), str) and item.get("activity_date")
+        }
+    )
+    series = [
+        {
+            "label": str(item.get("day") or ""),
+            "date": item.get("day"),
+            "sessions": item.get("session_count"),
+            "tokens": item.get("total_tokens"),
+            "messages": (
+                (_coerce_int(item.get("user_message_count")) or 0)
+                + (_coerce_int(item.get("assistant_message_count")) or 0)
+            ),
+            "toolCalls": item.get("tool_call_count"),
+        }
+        for item in usage_days
+    ]
+    return {
+        "filtered_sessions": len(summaries),
+        "total_sessions": len(summaries),
+        "total_projects": len(projects),
+        "total_tokens": total_tokens,
+        "total_messages": total_messages,
+        "total_tool_calls": total_tool_calls,
+        "active_days": active_days,
+        "refreshed_at": _utcnow_iso(),
+        "period_label": period_label,
+        "series": series,
+    }
 
 
 def _resolve_frontend_path(path_fragment: str) -> Path:
@@ -1711,9 +2497,30 @@ async def get_local_codex_jsonl(
     searchQuery: str = Query(""),
     projectQuery: str = Query(""),
     folderQuery: str = Query(""),
+    datePreset: str = Query(""),
+    updatedFrom: str = Query(""),
+    updatedTo: str = Query(""),
+    day: str = Query(""),
+    timeRange: str = Query(""),
+    dateFrom: str = Query(""),
+    dateTo: str = Query(""),
 ) -> BlobJSONLResponse:
+    effective_time_range = datePreset or timeRange
+    effective_date_from = updatedFrom or dateFrom
+    effective_date_to = updatedTo or dateTo
+
     if kind == "session-projects":
         summaries = _collect_local_codex_summaries(baseDir)
+        summaries = _filter_local_codex_summaries(
+            summaries,
+            search_query=searchQuery,
+            project_query=projectQuery,
+            folder_query=folderQuery,
+            day=day,
+            time_range=effective_time_range,
+            date_from=effective_date_from,
+            date_to=effective_date_to,
+        )
         projects = _collect_local_codex_projects(summaries)
         return _build_blob_response(
             data=projects,
@@ -1725,6 +2532,12 @@ async def get_local_codex_jsonl(
                 + urllib.parse.urlencode(
                     {
                         **({"baseDir": baseDir} if baseDir else {}),
+                        **({"searchQuery": searchQuery} if searchQuery else {}),
+                        **({"projectQuery": projectQuery} if projectQuery else {}),
+                        **({"folderQuery": folderQuery} if folderQuery else {}),
+                        **({"datePreset": datePreset} if datePreset else {}),
+                        **({"updatedFrom": updatedFrom} if updatedFrom else {}),
+                        **({"updatedTo": updatedTo} if updatedTo else {}),
                     }
                 )
             ),
@@ -1737,6 +2550,10 @@ async def get_local_codex_jsonl(
             search_query=searchQuery,
             project_query=projectQuery,
             folder_query=folderQuery,
+            day=day,
+            time_range=effective_time_range,
+            date_from=effective_date_from,
+            date_to=effective_date_to,
         )
         return _build_blob_response(
             data=data,
@@ -1751,9 +2568,80 @@ async def get_local_codex_jsonl(
                         **({"searchQuery": searchQuery} if searchQuery else {}),
                         **({"projectQuery": projectQuery} if projectQuery else {}),
                         **({"folderQuery": folderQuery} if folderQuery else {}),
+                        **({"datePreset": datePreset} if datePreset else {}),
+                        **({"updatedFrom": updatedFrom} if updatedFrom else {}),
+                        **({"updatedTo": updatedTo} if updatedTo else {}),
                     }
                 )
             ),
+        )
+
+    if kind == "usage-stats":
+        data = _collect_local_codex_summaries(baseDir)
+        filtered = _filter_local_codex_summaries(
+            data,
+            search_query=searchQuery,
+            project_query=projectQuery,
+            folder_query=folderQuery,
+            day=day,
+            time_range=effective_time_range,
+            date_from=effective_date_from,
+            date_to=effective_date_to,
+        )
+        projects = _collect_local_codex_projects(filtered)
+        usage_days = _collect_local_codex_usage_stats(filtered)
+        stats = _build_local_codex_stats_payload(
+            filtered,
+            projects,
+            usage_days,
+            period_label=(
+                "All time"
+                if not any(
+                    value.strip()
+                    for value in (
+                        datePreset,
+                        updatedFrom,
+                        updatedTo,
+                        day,
+                        timeRange,
+                        dateFrom,
+                        dateTo,
+                    )
+                )
+                else (datePreset or day or effective_time_range or f"{effective_date_from or '...'} to {effective_date_to or '...'}")
+            ),
+        )
+        query_string = urllib.parse.urlencode(
+            {
+                **({"baseDir": baseDir} if baseDir else {}),
+                **({"searchQuery": searchQuery} if searchQuery else {}),
+                **({"projectQuery": projectQuery} if projectQuery else {}),
+                **({"folderQuery": folderQuery} if folderQuery else {}),
+                **({"datePreset": datePreset} if datePreset else {}),
+                **({"updatedFrom": updatedFrom} if updatedFrom else {}),
+                **({"updatedTo": updatedTo} if updatedTo else {}),
+            }
+        )
+        return BlobJSONLResponse(
+            data=usage_days[offset : offset + limit],
+            offset=offset,
+            limit=limit,
+            total=len(usage_days),
+            isFiltered=bool(
+                searchQuery.strip()
+                or projectQuery.strip()
+                or folderQuery.strip()
+                or datePreset.strip()
+                or updatedFrom.strip()
+                or updatedTo.strip()
+                or day.strip()
+                or timeRange.strip()
+                or dateFrom.strip()
+                or dateTo.strip()
+            ),
+            matchedCount=len(usage_days),
+            resolvedURL=f"local-codex:///usage-stats{f'?{query_string}' if query_string else ''}",
+            stats=stats,
         )
 
     if kind == "session-open":

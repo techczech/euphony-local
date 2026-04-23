@@ -14,7 +14,8 @@ import type { Conversation } from '../../types/harmony-types';
 import {
   APIManager,
   BrowserAPIManager,
-  EUPHONY_API_URL
+  EUPHONY_API_URL,
+  extractConversationFromJSONL
 } from '../../utils/api-manager';
 import {
   connectCodexDirectory,
@@ -91,6 +92,8 @@ type MenuItems =
   | 'Code';
 
 type HomeBrowseView = 'sessions' | 'projects';
+type LocalSessionDatePreset = 'all' | 'yesterday' | 'last7' | 'last30' | 'custom';
+type LocalStatsMetric = 'sessions' | 'tokens' | 'messages' | 'toolCalls';
 
 const NUM_FORMATTER = format(',d');
 const DEFAULT_ITEMS_PER_PAGE = 10;
@@ -113,6 +116,11 @@ interface CodexSessionSummaryEntry {
   cwd?: string | null;
   project_name?: string | null;
   folder_path?: string | null;
+  display_folder?: string | null;
+  repo_folder?: string | null;
+  relative_folder?: string | null;
+  message_count?: number | null;
+  token_count?: number | null;
   first_user_text?: string;
   open_blob_url: string;
 }
@@ -122,6 +130,37 @@ interface CodexProjectSummaryEntry {
   project_name: string;
   folder_path: string;
   session_count: number;
+  display_folder?: string | null;
+  repo_folder?: string | null;
+  last_active_at?: string | null;
+  token_count?: number | null;
+  message_count?: number | null;
+  active_days?: number | null;
+  session_count_7d?: number | null;
+  session_count_30d?: number | null;
+}
+
+interface LocalCodexActivityPoint {
+  label: string;
+  date?: string;
+  sessions?: number;
+  tokens?: number;
+  messages?: number;
+  toolCalls?: number;
+}
+
+interface LocalCodexStats {
+  filteredSessions?: number;
+  totalSessions?: number;
+  totalProjects?: number;
+  totalTokens?: number;
+  totalMessages?: number;
+  totalToolCalls?: number;
+  activeDays?: number;
+  refreshedAt?: string;
+  periodLabel?: string;
+  series: LocalCodexActivityPoint[];
+  fallback: boolean;
 }
 
 interface QMDSearchEntry {
@@ -345,10 +384,31 @@ export class EuphonyApp extends LitElement {
   localSessionFolderQuery = '';
 
   @state()
+  localSessionDatePreset: LocalSessionDatePreset = 'all';
+
+  @state()
+  localSessionUpdatedFrom = '';
+
+  @state()
+  localSessionUpdatedTo = '';
+
+  @state()
   localProjectSummaries: CodexProjectSummaryEntry[] = [];
 
   @state()
   homeBrowseView: HomeBrowseView = 'sessions';
+
+  @state()
+  localSessionStats: LocalCodexStats | null = null;
+
+  @state()
+  isLoadingLocalSessionStats = false;
+
+  @state()
+  localSessionStatsMessage = '';
+
+  @state()
+  localStatsMetric: LocalStatsMetric = 'sessions';
 
   @state()
   localQMDQuery = '';
@@ -373,6 +433,7 @@ export class EuphonyApp extends LitElement {
 
   localSessionFilterDebounceHandle: number | null = null;
   localQMDSearchDebounceHandle: number | null = null;
+  localSessionStatsRefreshHandle: number | null = null;
 
   // Grid view mode
   @state()
@@ -520,6 +581,10 @@ export class EuphonyApp extends LitElement {
   }
 
   disconnectedCallback(): void {
+    if (this.localSessionStatsRefreshHandle !== null) {
+      window.clearInterval(this.localSessionStatsRefreshHandle);
+      this.localSessionStatsRefreshHandle = null;
+    }
     this.localDataWorker.terminate();
     super.disconnectedCallback();
   }
@@ -554,6 +619,25 @@ export class EuphonyApp extends LitElement {
         }
       });
     }
+
+    this.localSessionStatsRefreshHandle = window.setInterval(() => {
+      if (
+        this.isLoadingData ||
+        this.isFrontendOnlyMode ||
+        !this.isLocalSessionBrowserView
+      ) {
+        return;
+      }
+
+      this.refreshLocalProjectSummaries().then(
+        () => {},
+        () => {}
+      );
+      this.refreshLocalSessionStats().then(
+        () => {},
+        () => {}
+      );
+    }, 5 * 60 * 1000);
   }
 
   /**
@@ -1651,6 +1735,15 @@ export class EuphonyApp extends LitElement {
     if (this.localSessionFolderQuery.trim() !== '') {
       queryParams.set('folderQuery', this.localSessionFolderQuery.trim());
     }
+    if (this.localSessionDatePreset !== 'all') {
+      queryParams.set('datePreset', this.localSessionDatePreset);
+    }
+    if (this.localSessionUpdatedFrom !== '') {
+      queryParams.set('updatedFrom', this.localSessionUpdatedFrom);
+    }
+    if (this.localSessionUpdatedTo !== '') {
+      queryParams.set('updatedTo', this.localSessionUpdatedTo);
+    }
 
     const queryString = queryParams.toString();
     return `local-codex:///session-list${queryString ? `?${queryString}` : ''}`;
@@ -1662,9 +1755,47 @@ export class EuphonyApp extends LitElement {
     if (baseDir !== '') {
       queryParams.set('baseDir', baseDir);
     }
+    if (this.localSessionDatePreset !== 'all') {
+      queryParams.set('datePreset', this.localSessionDatePreset);
+    }
+    if (this.localSessionUpdatedFrom !== '') {
+      queryParams.set('updatedFrom', this.localSessionUpdatedFrom);
+    }
+    if (this.localSessionUpdatedTo !== '') {
+      queryParams.set('updatedTo', this.localSessionUpdatedTo);
+    }
 
     const queryString = queryParams.toString();
     return `local-codex:///session-projects${queryString ? `?${queryString}` : ''}`;
+  }
+
+  buildLocalCodexUsageStatsBlobURL() {
+    const queryParams = new URLSearchParams();
+    const baseDir = this.localCodexBaseDirOverride.trim();
+    if (baseDir !== '') {
+      queryParams.set('baseDir', baseDir);
+    }
+    if (this.localSessionSearchQuery.trim() !== '') {
+      queryParams.set('searchQuery', this.localSessionSearchQuery.trim());
+    }
+    if (this.localSessionProjectQuery.trim() !== '') {
+      queryParams.set('projectQuery', this.localSessionProjectQuery.trim());
+    }
+    if (this.localSessionFolderQuery.trim() !== '') {
+      queryParams.set('folderQuery', this.localSessionFolderQuery.trim());
+    }
+    if (this.localSessionDatePreset !== 'all') {
+      queryParams.set('datePreset', this.localSessionDatePreset);
+    }
+    if (this.localSessionUpdatedFrom !== '') {
+      queryParams.set('updatedFrom', this.localSessionUpdatedFrom);
+    }
+    if (this.localSessionUpdatedTo !== '') {
+      queryParams.set('updatedTo', this.localSessionUpdatedTo);
+    }
+
+    const queryString = queryParams.toString();
+    return `local-codex:///usage-stats${queryString ? `?${queryString}` : ''}`;
   }
 
   syncLocalSessionFiltersFromBlobURL(blobURL: string) {
@@ -1677,6 +1808,155 @@ export class EuphonyApp extends LitElement {
     this.localSessionProjectQuery =
       parsed.searchParams.get('projectQuery') ?? '';
     this.localSessionFolderQuery = parsed.searchParams.get('folderQuery') ?? '';
+    this.localSessionDatePreset =
+      (parsed.searchParams.get('datePreset') as LocalSessionDatePreset | null) ??
+      'all';
+    this.localSessionUpdatedFrom = parsed.searchParams.get('updatedFrom') ?? '';
+    this.localSessionUpdatedTo = parsed.searchParams.get('updatedTo') ?? '';
+  }
+
+  private formatDateInput(date: Date) {
+    const year = date.getFullYear();
+    const month = `${date.getMonth() + 1}`.padStart(2, '0');
+    const day = `${date.getDate()}`.padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  private getRelativeDate(daysBack: number) {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - daysBack);
+    return this.formatDateInput(date);
+  }
+
+  setLocalSessionDatePreset(preset: LocalSessionDatePreset) {
+    this.localSessionDatePreset = preset;
+
+    switch (preset) {
+      case 'all':
+        this.localSessionUpdatedFrom = '';
+        this.localSessionUpdatedTo = '';
+        break;
+      case 'yesterday': {
+        const yesterday = this.getRelativeDate(1);
+        this.localSessionUpdatedFrom = yesterday;
+        this.localSessionUpdatedTo = yesterday;
+        break;
+      }
+      case 'last7':
+        this.localSessionUpdatedFrom = this.getRelativeDate(6);
+        this.localSessionUpdatedTo = this.formatDateInput(new Date());
+        break;
+      case 'last30':
+        this.localSessionUpdatedFrom = this.getRelativeDate(29);
+        this.localSessionUpdatedTo = this.formatDateInput(new Date());
+        break;
+      case 'custom':
+      default:
+        break;
+    }
+  }
+
+  updateCustomLocalSessionDateRange(field: 'from' | 'to', value: string) {
+    this.localSessionDatePreset = 'custom';
+    if (field === 'from') {
+      this.localSessionUpdatedFrom = value;
+    } else {
+      this.localSessionUpdatedTo = value;
+    }
+  }
+
+  getLocalSessionDateSummary() {
+    switch (this.localSessionDatePreset) {
+      case 'yesterday':
+        return 'Yesterday';
+      case 'last7':
+        return 'Last 7 days';
+      case 'last30':
+        return 'Last 30 days';
+      case 'custom':
+        if (this.localSessionUpdatedFrom || this.localSessionUpdatedTo) {
+          return `${this.localSessionUpdatedFrom || '...'} to ${this.localSessionUpdatedTo || '...'}`;
+        }
+        return '';
+      default:
+        return '';
+    }
+  }
+
+  async fetchLocalCodexJSONLWithExtras({
+    blobURL,
+    offset,
+    limit,
+    jmespathQuery
+  }: {
+    blobURL: string;
+    offset: number;
+    limit: number;
+    jmespathQuery: string;
+  }): Promise<{
+    payload: {
+      total: number;
+      data: Conversation[] | string[] | unknown[];
+      isFiltered: boolean;
+      matchedCount: number;
+      resolvedURL: string;
+    };
+    rawResponse: Record<string, unknown>;
+  }> {
+    const parsedURL = new URL(blobURL);
+    const kind = parsedURL.pathname.replace(/^\//, '');
+    const queryPath = new URLSearchParams(parsedURL.searchParams);
+    queryPath.set('kind', kind);
+    queryPath.set('offset', offset.toString());
+    queryPath.set('limit', limit.toString());
+    if (jmespathQuery !== '') {
+      queryPath.set('jmespathQuery', jmespathQuery);
+    }
+
+    const result = await fetch(
+      `${this.apiManager.apiBaseURL}local-codex-jsonl/?${queryPath.toString()}`,
+      {
+        method: 'GET',
+        credentials: 'include'
+      }
+    );
+
+    if (!result.ok) {
+      try {
+        const errorResponse = (await result.json()) as { detail?: string };
+        throw new Error(errorResponse.detail || `${result.status}`);
+      } catch (error) {
+        if (error instanceof Error) {
+          throw error;
+        }
+        throw new Error(`Internal server error! status: ${result.status}`);
+      }
+    }
+
+    const response = (await result.json()) as Record<string, unknown>;
+    const responseData = Array.isArray(response.data) ? response.data : [];
+    const conversationData = extractConversationFromJSONL(responseData);
+
+    return {
+      payload: {
+        total:
+          typeof response.total === 'number'
+            ? response.total
+            : responseData.length,
+        data:
+          conversationData ??
+          (responseData as Conversation[] | string[] | unknown[]),
+        isFiltered: Boolean(response.isFiltered),
+        matchedCount:
+          typeof response.matchedCount === 'number'
+            ? response.matchedCount
+            : responseData.length,
+        resolvedURL:
+          typeof response.resolvedURL === 'string' ? response.resolvedURL : blobURL
+      },
+      rawResponse: response
+    };
   }
 
   async connectCodexFolder(showAlternateFolderOption: boolean) {
@@ -1781,6 +2061,7 @@ export class EuphonyApp extends LitElement {
       this.shouldShowAlternateCodexFolderOption =
         this.localCodexBaseDirOverride.trim() !== '';
       await this.refreshLocalProjectSummaries();
+      await this.refreshLocalSessionStats();
     }
   }
 
@@ -2024,8 +2305,11 @@ export class EuphonyApp extends LitElement {
 
         if (this.isCodexSessionSummaryList(typedData)) {
           await this.refreshLocalProjectSummaries();
+          await this.refreshLocalSessionStats();
         } else {
           this.localProjectSummaries = [];
+          this.localSessionStats = null;
+          this.localSessionStatsMessage = '';
         }
 
         this.isLoadingData = false;
@@ -2215,6 +2499,268 @@ export class EuphonyApp extends LitElement {
     return data.length > 0 && data.every(item => isCodexSessionSummaryEntry(item));
   }
 
+  private asRecord(value: unknown): Record<string, unknown> | null {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return null;
+    }
+    return value as Record<string, unknown>;
+  }
+
+  private asNumber(value: unknown) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return undefined;
+  }
+
+  private asString(value: unknown) {
+    return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+  }
+
+  private pickNumber(
+    record: Record<string, unknown> | null,
+    keys: string[]
+  ): number | undefined {
+    if (!record) {
+      return undefined;
+    }
+    for (const key of keys) {
+      const value = this.asNumber(record[key]);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+    return undefined;
+  }
+
+  private pickString(
+    record: Record<string, unknown> | null,
+    keys: string[]
+  ): string | undefined {
+    if (!record) {
+      return undefined;
+    }
+    for (const key of keys) {
+      const value = this.asString(record[key]);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+    return undefined;
+  }
+
+  private extractActivitySeries(
+    root: Record<string, unknown> | null
+  ): LocalCodexActivityPoint[] {
+    if (!root) {
+      return [];
+    }
+
+    const candidateKeys = [
+      'series',
+      'activity',
+      'activity_series',
+      'activitySeries',
+      'daily',
+      'daily_activity',
+      'timeline',
+      'buckets'
+    ];
+
+    for (const key of candidateKeys) {
+      const value = root[key];
+      if (!Array.isArray(value)) {
+        continue;
+      }
+
+      const normalized = value
+        .map(item => {
+          const record = this.asRecord(item);
+          if (!record) {
+            return null;
+          }
+          const date =
+            this.pickString(record, ['date', 'day', 'start', 'bucket']) ?? '';
+          const label =
+            this.pickString(record, ['label', 'date', 'day', 'bucket']) ?? date;
+          const sessions = this.pickNumber(record, [
+            'sessions',
+            'session_count',
+            'count'
+          ]);
+          const tokens = this.pickNumber(record, [
+            'tokens',
+            'token_count',
+            'total_tokens'
+          ]);
+          const messages = this.pickNumber(record, [
+            'messages',
+            'message_count',
+            'total_messages'
+          ]);
+          const toolCalls = this.pickNumber(record, [
+            'tool_calls',
+            'tool_call_count',
+            'total_tool_calls'
+          ]);
+
+          if (
+            label === '' &&
+            sessions === undefined &&
+            tokens === undefined &&
+            messages === undefined &&
+            toolCalls === undefined
+          ) {
+            return null;
+          }
+
+          return {
+            label: label || 'Unknown',
+            date: date || undefined,
+            sessions,
+            tokens,
+            messages,
+            toolCalls
+          };
+        })
+        .filter(item => item !== null) as LocalCodexActivityPoint[];
+
+      if (normalized.length > 0) {
+        return normalized.slice(-30);
+      }
+    }
+
+    return [];
+  }
+
+  private buildFallbackActivitySeries(
+    sessions: (Record<string, unknown> & CodexSessionSummaryEntry)[]
+  ): LocalCodexActivityPoint[] {
+    const byDay = new Map<
+      string,
+      { label: string; sessions: number; tokens: number; messages: number }
+    >();
+
+    for (const session of sessions) {
+      if (!session.updated_at) {
+        continue;
+      }
+      const date = new Date(session.updated_at);
+      if (Number.isNaN(date.getTime())) {
+        continue;
+      }
+      const key = this.formatDateInput(date);
+      const existing = byDay.get(key) ?? {
+        label: key,
+        sessions: 0,
+        tokens: 0,
+        messages: 0
+      };
+      existing.sessions += 1;
+      existing.tokens += session.token_count ?? 0;
+      existing.messages += session.message_count ?? 0;
+      byDay.set(key, existing);
+    }
+
+    return [...byDay.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(-30)
+      .map(([date, point]) => ({
+        label: point.label,
+        date,
+        sessions: point.sessions,
+        tokens: point.tokens || undefined,
+        messages: point.messages || undefined
+      }));
+  }
+
+  private extractLocalSessionStatsFromResponse(
+    response: Record<string, unknown>,
+    fallbackSessions: (Record<string, unknown> & CodexSessionSummaryEntry)[]
+  ): LocalCodexStats {
+    const statsRecord =
+      this.asRecord(response.stats) ??
+      this.asRecord(response.aggregates) ??
+      this.asRecord(response.summary) ??
+      this.asRecord(response.meta);
+
+    const extractedSeries = this.extractActivitySeries(statsRecord);
+    const series =
+      extractedSeries.length > 0
+        ? extractedSeries
+        : this.extractActivitySeries(response);
+
+    const totalSessions =
+      this.pickNumber(statsRecord, [
+        'total_sessions',
+        'sessions_total',
+        'session_count',
+        'total'
+      ]) ??
+      this.pickNumber(response, ['total']) ??
+      fallbackSessions.length;
+
+    const filteredSessions =
+      this.pickNumber(statsRecord, [
+        'filtered_sessions',
+        'matched_sessions',
+        'session_count_filtered'
+      ]) ??
+      this.pickNumber(response, ['matchedCount']) ??
+      fallbackSessions.length;
+
+    const totalProjects =
+      this.pickNumber(statsRecord, [
+        'total_projects',
+        'project_count',
+        'projects_total'
+      ]) ?? this.localProjectSummaries.length;
+
+    const normalizedSeries = series.length
+      ? series
+      : this.buildFallbackActivitySeries(fallbackSessions);
+
+    return {
+      filteredSessions,
+      totalSessions,
+      totalProjects,
+      totalTokens: this.pickNumber(statsRecord, [
+        'total_tokens',
+        'token_count',
+        'tokens'
+      ]),
+      totalMessages: this.pickNumber(statsRecord, [
+        'total_messages',
+        'message_count',
+        'messages'
+      ]),
+      totalToolCalls: this.pickNumber(statsRecord, [
+        'total_tool_calls',
+        'tool_call_count',
+        'tool_calls'
+      ]),
+      activeDays: this.pickNumber(statsRecord, [
+        'active_days',
+        'days_active'
+      ]),
+      refreshedAt: this.pickString(statsRecord, [
+        'refreshed_at',
+        'cache_refreshed_at'
+      ]),
+      periodLabel:
+        this.pickString(statsRecord, ['period_label', 'range_label']) ??
+        this.getLocalSessionDateSummary(),
+      series: normalizedSeries,
+      fallback: series.length === 0
+    };
+  }
+
   formatCodexUpdatedAt(updatedAt?: string) {
     if (!updatedAt) {
       return 'Unknown update time';
@@ -2228,19 +2774,44 @@ export class EuphonyApp extends LitElement {
     return date.toLocaleString();
   }
 
+  formatProjectCardPath(path: string, displayPath?: string | null) {
+    const usefulPath = (displayPath ?? '').trim() || path;
+    const parts = usefulPath.split('/').filter(Boolean);
+    if (parts.length >= 2 && usefulPath.startsWith('/')) {
+      return `${parts.at(-2)}/${parts.at(-1)}`;
+    }
+    return parts.at(-1) ?? usefulPath;
+  }
+
+  getCodexSessionBadges(
+    session: Record<string, unknown> & CodexSessionSummaryEntry
+  ) {
+    const rawCandidates = [
+      session.project_name,
+      session.display_folder,
+      session.repo_folder,
+      session.relative_folder,
+      session.folder_path
+    ];
+
+    const labels = rawCandidates
+      .filter((candidate): candidate is string => !!candidate && candidate.trim() !== '')
+      .map(candidate => this.formatProjectCardPath(candidate, candidate))
+      .filter((candidate, index, array) => {
+        const normalized = candidate.toLowerCase();
+        return (
+          candidate !== '' &&
+          array.findIndex(item => item.toLowerCase() === normalized) === index
+        );
+      });
+
+    return labels.slice(0, 2);
+  }
+
   formatCodexSessionLocation(
     session: Record<string, unknown> & CodexSessionSummaryEntry
   ) {
-    if (session.folder_path) {
-      const parts = session.folder_path.split('/').filter(Boolean);
-      return parts.at(-1) ?? session.folder_path;
-    }
-
-    if (session.project_name) {
-      return session.project_name;
-    }
-
-    return '';
+    return this.getCodexSessionBadges(session).at(0) ?? '';
   }
 
   formatQMDResultPath(file: string, result?: QMDSearchEntry) {
@@ -2256,11 +2827,6 @@ export class EuphonyApp extends LitElement {
     return file.replace(/^qmd:\/\/[^/]+\//, '');
   }
 
-  formatProjectCardPath(path: string) {
-    const parts = path.split('/').filter(Boolean);
-    return parts.at(-1) ?? path;
-  }
-
   formatSessionDisplayTitle(title?: string | null) {
     const raw = (title ?? '').trim();
     if (raw === '') {
@@ -2273,6 +2839,50 @@ export class EuphonyApp extends LitElement {
       .replace(/<[^>]+>/g, '')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  formatCompactMetric(value?: number | null) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return '0';
+    }
+    if (value >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(1)}M`;
+    }
+    if (value >= 1_000) {
+      return `${(value / 1_000).toFixed(1)}k`;
+    }
+    return NUM_FORMATTER(value);
+  }
+
+  getActivityMetricValue(
+    point: LocalCodexActivityPoint,
+    metric: LocalStatsMetric
+  ): number {
+    switch (metric) {
+      case 'tokens':
+        return point.tokens ?? 0;
+      case 'messages':
+        return point.messages ?? 0;
+      case 'toolCalls':
+        return point.toolCalls ?? 0;
+      case 'sessions':
+      default:
+        return point.sessions ?? 0;
+    }
+  }
+
+  getActivityMetricLabel(metric: LocalStatsMetric) {
+    switch (metric) {
+      case 'tokens':
+        return 'Tokens';
+      case 'messages':
+        return 'Messages';
+      case 'toolCalls':
+        return 'Tool calls';
+      case 'sessions':
+      default:
+        return 'Sessions';
+    }
   }
 
   formatQMDResultSnippet(snippet: string) {
@@ -2314,6 +2924,11 @@ export class EuphonyApp extends LitElement {
 
     if (this.localSessionFolderQuery.trim() !== '') {
       parts.push(`Folder matches "${this.localSessionFolderQuery.trim()}"`);
+    }
+
+    const dateSummary = this.getLocalSessionDateSummary();
+    if (dateSummary !== '') {
+      parts.push(`Time matches ${dateSummary}`);
     }
 
     return parts;
@@ -2486,6 +3101,35 @@ export class EuphonyApp extends LitElement {
       this.localProjectSummaries = data.filter(isCodexProjectSummaryEntry);
     } catch (_error) {
       this.localProjectSummaries = [];
+    }
+  }
+
+  async refreshLocalSessionStats() {
+    if (this.isFrontendOnlyMode) {
+      this.localSessionStats = null;
+      this.localSessionStatsMessage = '';
+      return;
+    }
+
+    this.isLoadingLocalSessionStats = true;
+    try {
+      const response = await this.fetchLocalCodexJSONLWithExtras({
+        blobURL: this.buildLocalCodexUsageStatsBlobURL(),
+        offset: 0,
+        limit: 366,
+        jmespathQuery: ''
+      });
+      const sessions = this.JSONData.filter(isCodexSessionSummaryEntry);
+      this.localSessionStats = this.extractLocalSessionStatsFromResponse(
+        response.rawResponse,
+        sessions
+      );
+      this.localSessionStatsMessage = '';
+    } catch (error) {
+      this.localSessionStats = null;
+      this.localSessionStatsMessage = `Failed to load usage stats: ${error}`;
+    } finally {
+      this.isLoadingLocalSessionStats = false;
     }
   }
 
@@ -2801,12 +3445,21 @@ export class EuphonyApp extends LitElement {
                   ${this.formatCodexUpdatedAt(curJSON.updated_at)}
                 </div>
               </div>
-              ${this.formatCodexSessionLocation(curJSON)
+              ${this.getCodexSessionBadges(curJSON).length > 0
                 ? html`
                     <div class="codex-session-index-meta-row">
-                      <span class="codex-session-index-badge">
-                        ${this.formatCodexSessionLocation(curJSON)}
-                      </span>
+                      ${this.getCodexSessionBadges(curJSON).map(
+                        badge => html`
+                          <span class="codex-session-index-badge">${badge}</span>
+                        `
+                      )}
+                      ${typeof curJSON.token_count === 'number'
+                        ? html`
+                            <span class="codex-session-index-badge">
+                              ${this.formatCompactMetric(curJSON.token_count)} tokens
+                            </span>
+                          `
+                        : html``}
                     </div>
                   `
                 : html``}
@@ -3014,9 +3667,207 @@ export class EuphonyApp extends LitElement {
         </div> `;
     }
 
+    const localSessionDateTemplate =
+      this.isLocalSessionBrowserView && this.homeBrowseView === 'sessions'
+        ? html`
+            <div class="local-session-date-bar">
+              ${(
+                [
+                  ['all', 'All time'],
+                  ['yesterday', 'Yesterday'],
+                  ['last7', 'Last 7 days'],
+                  ['last30', 'Last 30 days']
+                ] as Array<[LocalSessionDatePreset, string]>
+              ).map(
+                ([preset, label]) => html`
+                  <button
+                    class="button-codex-secondary ${this.localSessionDatePreset ===
+                    preset
+                      ? 'is-active'
+                      : ''}"
+                    @click=${() => {
+                      this.setLocalSessionDatePreset(preset);
+                      this.applyLocalSessionFilters().then(
+                        () => {},
+                        () => {}
+                      );
+                    }}
+                  >
+                    ${label}
+                  </button>
+                `
+              )}
+              <label class="local-date-input-group">
+                <span>From</span>
+                <input
+                  type="date"
+                  .value=${this.localSessionUpdatedFrom}
+                  @input=${(e: Event) => {
+                    this.updateCustomLocalSessionDateRange(
+                      'from',
+                      (e.target as HTMLInputElement).value
+                    );
+                    this.queueLocalSessionFilterApply();
+                  }}
+                />
+              </label>
+              <label class="local-date-input-group">
+                <span>To</span>
+                <input
+                  type="date"
+                  .value=${this.localSessionUpdatedTo}
+                  @input=${(e: Event) => {
+                    this.updateCustomLocalSessionDateRange(
+                      'to',
+                      (e.target as HTMLInputElement).value
+                    );
+                    this.queueLocalSessionFilterApply();
+                  }}
+                />
+              </label>
+            </div>
+          `
+        : html``;
+
+    const activitySeries = this.localSessionStats?.series ?? [];
+    const activityMax = Math.max(
+      1,
+      ...activitySeries.map(point =>
+        this.getActivityMetricValue(point, this.localStatsMetric)
+      )
+    );
+    const localSessionStatsTemplate =
+      this.isLocalSessionBrowserView && this.homeBrowseView === 'sessions'
+        ? html`
+            <div class="local-session-stats-panel">
+              <div class="local-session-stats-header">
+                <div>
+                  <div class="local-session-stats-title">Activity</div>
+                  <div class="local-session-stats-subtitle">
+                    ${this.localSessionStats?.periodLabel || 'All time'}
+                  </div>
+                </div>
+                <div class="local-session-stats-metric-buttons">
+                  ${(
+                    [
+                      ['sessions', 'Sessions'],
+                      ['tokens', 'Tokens'],
+                      ['messages', 'Messages'],
+                      ['toolCalls', 'Tool calls']
+                    ] as Array<[LocalStatsMetric, string]>
+                  ).map(
+                    ([metric, label]) => html`
+                      <button
+                        class="button-codex-secondary ${this.localStatsMetric ===
+                        metric
+                          ? 'is-active'
+                          : ''}"
+                        @click=${() => {
+                          this.localStatsMetric = metric;
+                        }}
+                      >
+                        ${label}
+                      </button>
+                    `
+                  )}
+                </div>
+              </div>
+              ${this.isLoadingLocalSessionStats
+                ? html`<div class="local-session-stats-status">Loading usage stats...</div>`
+                : this.localSessionStatsMessage
+                  ? html`
+                      <div class="local-session-stats-status">
+                        ${this.localSessionStatsMessage}
+                      </div>
+                    `
+                  : this.localSessionStats
+                    ? html`
+                        <div class="local-session-stats-grid">
+                          <div class="local-session-stat-card">
+                            <span class="local-session-stat-label">Sessions</span>
+                            <span class="local-session-stat-value"
+                              >${this.formatCompactMetric(
+                                this.localSessionStats.filteredSessions
+                              )}</span
+                            >
+                          </div>
+                          <div class="local-session-stat-card">
+                            <span class="local-session-stat-label">Projects</span>
+                            <span class="local-session-stat-value"
+                              >${this.formatCompactMetric(
+                                this.localSessionStats.totalProjects
+                              )}</span
+                            >
+                          </div>
+                          <div class="local-session-stat-card">
+                            <span class="local-session-stat-label">Tokens</span>
+                            <span class="local-session-stat-value"
+                              >${this.formatCompactMetric(
+                                this.localSessionStats.totalTokens
+                              )}</span
+                            >
+                          </div>
+                          <div class="local-session-stat-card">
+                            <span class="local-session-stat-label">Messages</span>
+                            <span class="local-session-stat-value"
+                              >${this.formatCompactMetric(
+                                this.localSessionStats.totalMessages
+                              )}</span
+                            >
+                          </div>
+                        </div>
+                        ${activitySeries.length > 0
+                          ? html`
+                              <div class="local-session-chart">
+                                ${activitySeries.map(
+                                  point => html`
+                                    <div class="local-session-chart-column">
+                                      <div
+                                        class="local-session-chart-bar"
+                                        style=${`height: ${Math.max(
+                                          6,
+                                          (this.getActivityMetricValue(
+                                            point,
+                                            this.localStatsMetric
+                                          ) /
+                                            activityMax) *
+                                            120
+                                        )}px`}
+                                        title=${`${point.label}: ${this.formatCompactMetric(
+                                          this.getActivityMetricValue(
+                                            point,
+                                            this.localStatsMetric
+                                          )
+                                        )} ${this
+                                          .getActivityMetricLabel(
+                                            this.localStatsMetric
+                                          )
+                                          .toLowerCase()}`}
+                                      ></div>
+                                      <div class="local-session-chart-label">
+                                        ${point.label.slice(5)}
+                                      </div>
+                                    </div>
+                                  `
+                                )}
+                              </div>
+                            `
+                          : html`
+                              <div class="local-session-stats-status">
+                                No activity points available for this range.
+                              </div>
+                            `}
+                      `
+                    : html``}
+            </div>
+          `
+        : html``;
+
     const localSessionFilterTemplate =
       this.isLocalSessionBrowserView && this.homeBrowseView === 'sessions'
         ? html`
+            ${localSessionDateTemplate}
+            ${localSessionStatsTemplate}
             <div class="local-session-filter-bar">
               <sl-input
                 size="small"
@@ -3026,14 +3877,6 @@ export class EuphonyApp extends LitElement {
                   const target = e.target as HTMLInputElement;
                   this.localSessionSearchQuery = target.value;
                   this.queueLocalSessionFilterApply();
-                }}
-                @keydown=${(e: KeyboardEvent) => {
-                  if (e.key === 'Enter') {
-                    this.applyLocalSessionFilters().then(
-                      () => {},
-                      () => {}
-                    );
-                  }
                 }}
               ></sl-input>
               <sl-input
@@ -3045,14 +3888,6 @@ export class EuphonyApp extends LitElement {
                   this.localSessionProjectQuery = target.value;
                   this.queueLocalSessionFilterApply();
                 }}
-                @keydown=${(e: KeyboardEvent) => {
-                  if (e.key === 'Enter') {
-                    this.applyLocalSessionFilters().then(
-                      () => {},
-                      () => {}
-                    );
-                  }
-                }}
               ></sl-input>
               <sl-input
                 size="small"
@@ -3063,14 +3898,6 @@ export class EuphonyApp extends LitElement {
                   this.localSessionFolderQuery = target.value;
                   this.queueLocalSessionFilterApply();
                 }}
-                @keydown=${(e: KeyboardEvent) => {
-                  if (e.key === 'Enter') {
-                    this.applyLocalSessionFilters().then(
-                      () => {},
-                      () => {}
-                    );
-                  }
-                }}
               ></sl-input>
               <button
                 class="button-codex-secondary"
@@ -3078,6 +3905,7 @@ export class EuphonyApp extends LitElement {
                   this.localSessionSearchQuery = '';
                   this.localSessionProjectQuery = '';
                   this.localSessionFolderQuery = '';
+                  this.setLocalSessionDatePreset('all');
                   this.applyLocalSessionFilters().then(
                     () => {},
                     () => {}
@@ -3088,7 +3916,7 @@ export class EuphonyApp extends LitElement {
               </button>
             </div>
             <div class="local-search-help">
-              Session filter searches session title, first real prompt, project, and folder metadata.
+              Session filter searches session title, first real prompt, project, folder metadata, and time range.
             </div>
             ${this.getLocalSessionMatchSummary().length > 0
               ? html`
@@ -3277,10 +4105,46 @@ export class EuphonyApp extends LitElement {
                       ${project.project_name}
                     </div>
                     <div class="local-project-card-path">
-                      ${this.formatProjectCardPath(project.folder_path)}
+                      ${this.formatProjectCardPath(
+                        project.folder_path,
+                        project.display_folder
+                      )}
                     </div>
                     <div class="local-project-card-count">
                       ${project.session_count} session${project.session_count === 1 ? '' : 's'}
+                    </div>
+                    ${project.last_active_at
+                      ? html`
+                          <div class="local-project-card-meta">
+                            Last active ${this.formatCodexUpdatedAt(project.last_active_at)}
+                          </div>
+                        `
+                      : html``}
+                    <div class="local-project-card-metrics">
+                      ${typeof project.token_count === 'number'
+                        ? html`
+                            <span class="codex-session-index-badge">
+                              ${this.formatCompactMetric(project.token_count)} tokens
+                            </span>
+                          `
+                        : html``}
+                      ${typeof project.active_days === 'number'
+                        ? html`
+                            <span class="codex-session-index-badge">
+                              ${project.active_days} active day${project.active_days === 1
+                                ? ''
+                                : 's'}
+                            </span>
+                          `
+                        : html``}
+                      ${typeof project.session_count_7d === 'number' &&
+                      project.session_count_7d > 0
+                        ? html`
+                            <span class="codex-session-index-badge">
+                              ${project.session_count_7d} in 7d
+                            </span>
+                          `
+                        : html``}
                     </div>
                   </button>
                 `

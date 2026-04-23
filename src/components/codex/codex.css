@@ -35,6 +35,12 @@
   margin-bottom: 12px;
 }
 
+.session-toolbar-hint {
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+  color: var(--gray-600);
+}
+
 .session-toolbar-title {
   font-size: 0.95rem;
   font-weight: 700;
@@ -58,6 +64,12 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.session-toolbar-summary {
+  margin-top: 10px;
+  font-size: 0.8rem;
+  color: var(--gray-600);
 }
 
 .session-toolbar-subtitle {
@@ -87,6 +99,7 @@
   border-color: var(--blue-300);
   background: var(--blue-50);
   color: var(--blue-800);
+  font-weight: 600;
 }
 
 .session-toolbar-button-secondary {

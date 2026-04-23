@@ -106,31 +106,19 @@ export class EuphonyCodex extends LitElement {
   sessionMessageSearch = '';
 
   @state()
-  showUserMessages = true;
+  selectedCategories: string[] = [];
 
   @state()
-  showAssistantMessages = true;
+  availableEventTypes: string[] = [];
 
   @state()
-  showReasoningMessages = true;
+  availablePayloadTypes: string[] = [];
 
   @state()
-  showToolCalls = true;
+  selectedEventTypes: string[] = [];
 
   @state()
-  showToolOutputs = true;
-
-  @state()
-  showInstructionMessages = true;
-
-  @state()
-  showSystemMessages = true;
-
-  @state()
-  enabledEventTypes: string[] = [];
-
-  @state()
-  enabledPayloadTypes: string[] = [];
+  selectedPayloadTypes: string[] = [];
 
   @query('euphony-conversation')
   conversationComponent: EuphonyConversation | undefined;
@@ -179,8 +167,13 @@ export class EuphonyCodex extends LitElement {
     }
 
     this.baseConversation = parseResult.conversation;
-    this.enabledEventTypes = this.getAvailableEventTypes(parseResult.conversation);
-    this.enabledPayloadTypes = this.getAvailablePayloadTypes(parseResult.conversation);
+    this.availableEventTypes = this.getAvailableEventTypes(parseResult.conversation);
+    this.availablePayloadTypes = this.getAvailablePayloadTypes(
+      parseResult.conversation
+    );
+    this.selectedCategories = [];
+    this.selectedEventTypes = [];
+    this.selectedPayloadTypes = [];
     this.applySessionFilters();
     this.parseError = null;
   }
@@ -234,6 +227,48 @@ export class EuphonyCodex extends LitElement {
     return 'system';
   }
 
+  private getCategoryLabel(category: string) {
+    switch (category) {
+      case 'user':
+        return 'User';
+      case 'assistant':
+        return 'Assistant';
+      case 'reasoning':
+        return 'Reasoning';
+      case 'tool-call':
+        return 'Tool calls';
+      case 'tool-output':
+        return 'Tool outputs';
+      case 'instructions':
+        return 'Instructions';
+      case 'system':
+        return 'System';
+      default:
+        return category;
+    }
+  }
+
+  private getSelectedSummary(selectedValues: string[], fallbackLabel: string) {
+    if (selectedValues.length === 0) {
+      return fallbackLabel;
+    }
+
+    return `Showing ${selectedValues.join(', ')}`;
+  }
+
+  private toggleSelectedValue(
+    currentValues: string[],
+    value: string,
+    setValues: (values: string[]) => void
+  ) {
+    setValues(
+      currentValues.includes(value)
+        ? currentValues.filter(currentValue => currentValue !== value)
+        : [...currentValues, value]
+    );
+    this.applySessionFilters();
+  }
+
   private getMessageSearchText(message: Message): string {
     const textParts: string[] = [];
     if (typeof message.name === 'string') {
@@ -266,35 +301,26 @@ export class EuphonyCodex extends LitElement {
 
   private shouldShowMessage(message: Message) {
     const category = this.getMessageCategory(message);
-    if (category === 'user' && !this.showUserMessages) {
-      return false;
-    }
-    if (category === 'assistant' && !this.showAssistantMessages) {
-      return false;
-    }
-    if (category === 'reasoning' && !this.showReasoningMessages) {
-      return false;
-    }
-    if (category === 'tool-call' && !this.showToolCalls) {
-      return false;
-    }
-    if (category === 'tool-output' && !this.showToolOutputs) {
-      return false;
-    }
-    if (category === 'instructions' && !this.showInstructionMessages) {
-      return false;
-    }
-    if (category === 'system' && !this.showSystemMessages) {
+    if (
+      this.selectedCategories.length > 0 &&
+      !this.selectedCategories.includes(category)
+    ) {
       return false;
     }
 
     const eventType = this.getMessageMetadataValue(message, 'codex_event_type');
-    if (eventType && !this.enabledEventTypes.includes(eventType)) {
+    if (
+      this.selectedEventTypes.length > 0 &&
+      (!eventType || !this.selectedEventTypes.includes(eventType))
+    ) {
       return false;
     }
 
     const payloadType = this.getMessageMetadataValue(message, 'codex_payload_type');
-    if (payloadType && !this.enabledPayloadTypes.includes(payloadType)) {
+    if (
+      this.selectedPayloadTypes.length > 0 &&
+      (!payloadType || !this.selectedPayloadTypes.includes(payloadType))
+    ) {
       return false;
     }
 
@@ -320,41 +346,36 @@ export class EuphonyCodex extends LitElement {
     };
   }
 
-  private toggleSessionVisibility(
-    key:
-      | 'showUserMessages'
-      | 'showAssistantMessages'
-      | 'showReasoningMessages'
-      | 'showToolCalls'
-      | 'showToolOutputs'
-      | 'showInstructionMessages'
-      | 'showSystemMessages'
-  ) {
-    this[key] = !this[key];
-    this.applySessionFilters();
+  private toggleCategory(category: string) {
+    this.toggleSelectedValue(this.selectedCategories, category, values => {
+      this.selectedCategories = values;
+    });
   }
 
   private async jumpToFirstVisibleMessage() {
     await this.updateComplete;
     await this.conversationComponent?.updateComplete;
+    const firstUserIndex =
+      this.conversation?.messages.findIndex(
+        message => this.getMessageCategory(message) === 'user'
+      ) ?? -1;
+    const targetIndex = firstUserIndex >= 0 ? firstUserIndex : 0;
     const target =
-      this.conversationComponent?.getMessageByIndex(0) ??
+      this.conversationComponent?.getMessageByIndex(targetIndex) ??
       this.conversationComponent?.shadowRoot?.querySelector('.message');
     target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
   private toggleEventType(eventType: string) {
-    this.enabledEventTypes = this.enabledEventTypes.includes(eventType)
-      ? this.enabledEventTypes.filter(value => value !== eventType)
-      : [...this.enabledEventTypes, eventType];
-    this.applySessionFilters();
+    this.toggleSelectedValue(this.selectedEventTypes, eventType, values => {
+      this.selectedEventTypes = values;
+    });
   }
 
   private togglePayloadType(payloadType: string) {
-    this.enabledPayloadTypes = this.enabledPayloadTypes.includes(payloadType)
-      ? this.enabledPayloadTypes.filter(value => value !== payloadType)
-      : [...this.enabledPayloadTypes, payloadType];
-    this.applySessionFilters();
+    this.toggleSelectedValue(this.selectedPayloadTypes, payloadType, values => {
+      this.selectedPayloadTypes = values;
+    });
   }
 
   private resetSessionFilters() {
@@ -363,15 +384,9 @@ export class EuphonyCodex extends LitElement {
     }
 
     this.sessionMessageSearch = '';
-    this.showUserMessages = true;
-    this.showAssistantMessages = true;
-    this.showReasoningMessages = true;
-    this.showToolCalls = true;
-    this.showToolOutputs = true;
-    this.showInstructionMessages = true;
-    this.showSystemMessages = true;
-    this.enabledEventTypes = this.getAvailableEventTypes(this.baseConversation);
-    this.enabledPayloadTypes = this.getAvailablePayloadTypes(this.baseConversation);
+    this.selectedCategories = [];
+    this.selectedEventTypes = [];
+    this.selectedPayloadTypes = [];
     this.applySessionFilters();
   }
 
@@ -405,6 +420,10 @@ export class EuphonyCodex extends LitElement {
                 : html``}
             </div>
           </div>
+          <div class="session-toolbar-hint">
+            Select pills to focus the view. With no pills selected, the session
+            shows everything.
+          </div>
           <div class="session-toolbar-controls">
             <sl-input
               size="small"
@@ -418,63 +437,63 @@ export class EuphonyCodex extends LitElement {
             ></sl-input>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showUserMessages}
+              ?is-active=${this.selectedCategories.includes('user')}
               @click=${() => {
-                this.toggleSessionVisibility('showUserMessages');
+                this.toggleCategory('user');
               }}
             >
               User
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showAssistantMessages}
+              ?is-active=${this.selectedCategories.includes('assistant')}
               @click=${() => {
-                this.toggleSessionVisibility('showAssistantMessages');
+                this.toggleCategory('assistant');
               }}
             >
               Assistant
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showReasoningMessages}
+              ?is-active=${this.selectedCategories.includes('reasoning')}
               @click=${() => {
-                this.toggleSessionVisibility('showReasoningMessages');
+                this.toggleCategory('reasoning');
               }}
             >
               Reasoning
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showToolCalls}
+              ?is-active=${this.selectedCategories.includes('tool-call')}
               @click=${() => {
-                this.toggleSessionVisibility('showToolCalls');
+                this.toggleCategory('tool-call');
               }}
             >
               Tool calls
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showToolOutputs}
+              ?is-active=${this.selectedCategories.includes('tool-output')}
               @click=${() => {
-                this.toggleSessionVisibility('showToolOutputs');
+                this.toggleCategory('tool-output');
               }}
             >
               Tool outputs
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showInstructionMessages}
+              ?is-active=${this.selectedCategories.includes('instructions')}
               @click=${() => {
-                this.toggleSessionVisibility('showInstructionMessages');
+                this.toggleCategory('instructions');
               }}
             >
               Instructions
             </button>
             <button
               class="session-toolbar-button"
-              ?is-active=${this.showSystemMessages}
+              ?is-active=${this.selectedCategories.includes('system')}
               @click=${() => {
-                this.toggleSessionVisibility('showSystemMessages');
+                this.toggleCategory('system');
               }}
             >
               System
@@ -499,16 +518,30 @@ export class EuphonyCodex extends LitElement {
               Reset
             </button>
           </div>
-          ${this.enabledEventTypes.length > 0
+          <div class="session-toolbar-summary">
+            ${this.getSelectedSummary(
+              this.selectedCategories.map(category =>
+                this.getCategoryLabel(category)
+              ),
+              'Showing all categories'
+            )}
+          </div>
+          ${this.availableEventTypes.length > 0
             ? html`
                 <div class="session-toolbar-subsection">
                   <div class="session-toolbar-subtitle">Event types</div>
+                  <div class="session-toolbar-summary">
+                    ${this.getSelectedSummary(
+                      this.selectedEventTypes,
+                      'Showing all event types'
+                    )}
+                  </div>
                   <div class="session-toolbar-controls">
-                    ${this.getAvailableEventTypes(this.baseConversation!).map(
+                    ${this.availableEventTypes.map(
                       eventType => html`
                         <button
                           class="session-toolbar-button"
-                          ?is-active=${this.enabledEventTypes.includes(eventType)}
+                          ?is-active=${this.selectedEventTypes.includes(eventType)}
                           @click=${() => {
                             this.toggleEventType(eventType);
                           }}
@@ -521,16 +554,24 @@ export class EuphonyCodex extends LitElement {
                 </div>
               `
             : html``}
-          ${this.enabledPayloadTypes.length > 0
+          ${this.availablePayloadTypes.length > 0
             ? html`
                 <div class="session-toolbar-subsection">
                   <div class="session-toolbar-subtitle">Response or payload types</div>
+                  <div class="session-toolbar-summary">
+                    ${this.getSelectedSummary(
+                      this.selectedPayloadTypes,
+                      'Showing all payload types'
+                    )}
+                  </div>
                   <div class="session-toolbar-controls">
-                    ${this.getAvailablePayloadTypes(this.baseConversation!).map(
+                    ${this.availablePayloadTypes.map(
                       payloadType => html`
                         <button
                           class="session-toolbar-button"
-                          ?is-active=${this.enabledPayloadTypes.includes(payloadType)}
+                          ?is-active=${this.selectedPayloadTypes.includes(
+                            payloadType
+                          )}
                           @click=${() => {
                             this.togglePayloadType(payloadType);
                           }}
